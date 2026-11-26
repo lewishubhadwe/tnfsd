@@ -1,27 +1,36 @@
 import asyncio
-import base64
 import json
 import os
 import random
+import threading
 import urllib.parse
-import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import aiohttp
 import websockets
 
 # ================= CONFIGURATION =================
-# Option A (Recommended): Set DISCORD_TOKENS as a comma-separated env var in Render.
-# Option B: Pack your tokens locally once and paste (b85_payload, seed) tuples below.
-# Helper to pack locally without putting raw tokens in Git:
-#   python -c "import base64, zlib; p=lambda t,s: base64.b85encode(bytes(reversed(bytes(b^((s*1315423911+2654435761)&0xFFFFFFFF).to_bytes(4,'big')[i%4] for i,b in enumerate(zlib.compress(t.encode(),9)))))).decode(); print((p(input('token: '), 101), 101))"
-_ENCODED_TOKENS: list[tuple[str, int]] = []
+TOKENS = [
+    "MTU0ODYyMDE3NjI4OTgyODg4Ng.G9dDdz.FPbbTGl5qZLN0xXDCA0Qh3buPd3iXr-PnMXAE8",
+    "MTUxMzc1MjAyMzg5NDU4OTU3MQ.GynV0M.9FOEhplb8wlWE8Ye2H5wihUJxR3vpfrfBGr_xI",
+]
 
-TARGET_CHANNEL_IDS: list[str] = []
+# Empty list = monitor all channels in all servers & DMs
+TARGET_CHANNEL_IDS = []
+
+# Only trigger on messages from this username
 TARGET_USERNAME = "iloves3xworkers"
+
+# Repeat the exact text content sent by TARGET_USERNAME
 REPEAT_MESSAGES = True
+
+# Discord's :rofl: emoji
 EMOJIS = ["🤣"]
 
-MIN_DELAY = 0.6
-MAX_DELAY = 1.5
+# Random delay range (in seconds) before reacting/sending
+MIN_DELAY = 0.1
+MAX_DELAY = 0.4
+
+# Set True to print every incoming message author & channel for debugging
 DEBUG = False
 
 GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
@@ -29,27 +38,24 @@ API_BASE = "https://discord.com/api/v10"
 # =================================================
 
 
-def _pack_token(raw_token: str, seed: int) -> str:
-    compressed = zlib.compress(raw_token.encode("utf-8"), level=9)
-    mask = ((seed * 1315423911 + 2654435761) & 0xFFFFFFFF).to_bytes(4, "big")
-    xored = bytes(b ^ mask[i % len(mask)] for i, b in enumerate(compressed))
-    reordered = bytes(reversed(xored))
-    return base64.b85encode(reordered).decode("ascii")
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
 
 
-def _unpack_token(blob: str, seed: int) -> str:
-    reordered = base64.b85decode(blob.encode("ascii"))
-    xored = bytes(reversed(reordered))
-    mask = ((seed * 1315423911 + 2654435761) & 0xFFFFFFFF).to_bytes(4, "big")
-    compressed = bytes(b ^ mask[i % len(mask)] for i, b in enumerate(xored))
-    return zlib.decompress(compressed).decode("utf-8")
-
-
-def get_tokens() -> list[str]:
-    env_tokens = [t.strip() for t in os.getenv("DISCORD_TOKENS", "").split(",") if t.strip()]
-    if env_tokens:
-        return env_tokens
-    return [_unpack_token(blob, seed) for blob, seed in _ENCODED_TOKENS]
+def start_http_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"HTTP health server listening on 0.0.0.0:{port}")
+    return server
 
 
 def build_headers(token: str) -> dict:
@@ -60,65 +66,48 @@ def build_headers(token: str) -> dict:
     }
 
 
-async def add_reaction(
-    session: aiohttp.ClientSession,
-    token: str,
-    channel_id: str,
-    message_id: str,
-    emoji: str,
-    idx: int,
-):
+async def add_reaction(session: aiohttp.ClientSession, token: str, channel_id: str, message_id: str, emoji: str, idx: int):
     encoded_emoji = urllib.parse.quote(emoji)
     url = f"{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
     headers = build_headers(token)
-    try:
-        async with session.put(url, headers=headers) as resp:
-            if resp.status in (200, 204):
-                print(f"[Account {idx}] Reacted with {emoji} in channel {channel_id}")
-            elif resp.status == 429:
-                data = await resp.json()
-                retry_after = float(data.get("retry_after", 1.5))
-                print(f"[Account {idx}] Reaction rate limited (429), retrying after {retry_after}s")
-                await asyncio.sleep(retry_after)
-                async with session.put(url, headers=headers) as retry_resp:
-                    if retry_resp.status in (200, 204):
-                        print(f"[Account {idx}] Reacted with {emoji} after retry in {channel_id}")
-                    else:
-                        print(f"[Account {idx}] Reaction retry failed ({retry_resp.status}): {await retry_resp.text()}")
-            else:
-                print(f"[Account {idx}] Reaction failed ({resp.status}): {await resp.text()}")
-    except aiohttp.ClientError as e:
-        print(f"[Account {idx}] Reaction network error: {e}")
+    async with session.put(url, headers=headers) as resp:
+        if resp.status in (200, 204):
+            print(f"[Account {idx}] Reacted with {emoji} in channel {channel_id}")
+        elif resp.status == 429:
+            data = await resp.json()
+            retry_after = float(data.get("retry_after", 1.0))
+            print(f"[Account {idx}] Reaction rate limited (429), retrying after {retry_after}s")
+            await asyncio.sleep(retry_after)
+            async with session.put(url, headers=headers) as retry_resp:
+                if retry_resp.status in (200, 204):
+                    print(f"[Account {idx}] Reacted with {emoji} after retry in {channel_id}")
+                else:
+                    print(f"[Account {idx}] Reaction retry failed ({retry_resp.status}): {await retry_resp.text()}")
+        else:
+            body = await resp.text()
+            print(f"[Account {idx}] Reaction failed ({resp.status}): {body}")
 
 
-async def send_message(
-    session: aiohttp.ClientSession,
-    token: str,
-    channel_id: str,
-    content: str,
-    idx: int,
-):
+async def send_message(session: aiohttp.ClientSession, token: str, channel_id: str, content: str, idx: int):
     url = f"{API_BASE}/channels/{channel_id}/messages"
     headers = build_headers(token)
     payload = {"content": content}
-    try:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            if resp.status in (200, 201):
-                print(f"[Account {idx}] Sent message in channel {channel_id}: {content}")
-            elif resp.status == 429:
-                data = await resp.json()
-                retry_after = float(data.get("retry_after", 1.5))
-                print(f"[Account {idx}] Message rate limited (429), retrying after {retry_after}s")
-                await asyncio.sleep(retry_after)
-                async with session.post(url, headers=headers, json=payload) as retry_resp:
-                    if retry_resp.status in (200, 201):
-                        print(f"[Account {idx}] Sent message after retry in channel {channel_id}: {content}")
-                    else:
-                        print(f"[Account {idx}] Message retry failed ({retry_resp.status}): {await retry_resp.text()}")
-            else:
-                print(f"[Account {idx}] Message failed ({resp.status}): {await resp.text()}")
-    except aiohttp.ClientError as e:
-        print(f"[Account {idx}] Message network error: {e}")
+    async with session.post(url, headers=headers, json=payload) as resp:
+        if resp.status in (200, 201):
+            print(f"[Account {idx}] Sent message in channel {channel_id}: {content}")
+        elif resp.status == 429:
+            data = await resp.json()
+            retry_after = float(data.get("retry_after", 1.0))
+            print(f"[Account {idx}] Message rate limited (429), retrying after {retry_after}s")
+            await asyncio.sleep(retry_after)
+            async with session.post(url, headers=headers, json=payload) as retry_resp:
+                if retry_resp.status in (200, 201):
+                    print(f"[Account {idx}] Sent message after retry in channel {channel_id}: {content}")
+                else:
+                    print(f"[Account {idx}] Message retry failed ({retry_resp.status}): {await retry_resp.text()}")
+        else:
+            body = await resp.text()
+            print(f"[Account {idx}] Message failed ({resp.status}): {body}")
 
 
 async def heartbeat_loop(ws, interval: float, seq_holder: dict):
@@ -131,8 +120,7 @@ async def run_account(token: str, idx: int):
     seq_holder = {"seq": None}
     my_user_id = None
 
-    connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession() as session:
         while True:
             try:
                 async with websockets.connect(GATEWAY_URL, max_size=None) as ws:
@@ -197,15 +185,13 @@ async def run_account(token: str, idx: int):
                         hb_task.cancel()
 
             except Exception as e:
-                print(f"[Account {idx}] Gateway disconnected ({e}), reconnecting in 3s...")
+                print(f"[Account {idx}] Disconnected ({e}), reconnecting in 3s...")
                 await asyncio.sleep(3)
 
 
 async def main():
-    tokens = get_tokens()
-    if not tokens:
-        raise RuntimeError("No tokens found in DISCORD_TOKENS or _ENCODED_TOKENS.")
-    await asyncio.gather(*(run_account(token, idx) for idx, token in enumerate(tokens, start=1)))
+    start_http_server()
+    await asyncio.gather(*(run_account(token, idx) for idx, token in enumerate(TOKENS, start=1)))
 
 
 if __name__ == "__main__":
